@@ -1,0 +1,72 @@
+version: "3.8"
+
+services:
+  agos-app:
+    build: .
+    container_name: agos-monitoring
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+    networks:
+      - agos-network
+    depends_on:
+      - agos-db
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--quiet",
+          "--tries=1",
+          "--spider",
+          "http://localhost:3000/api/health",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  agos-db:
+    image: postgres:15-alpine
+    container_name: agos-database
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-agos_monitoring}
+      POSTGRES_USER: ${DB_USER:-agos_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - agos-network
+    ports:
+      - "5432:5432"
+
+  nginx:
+    image: nginx:alpine
+    container_name: agos-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/ssl:/etc/nginx/ssl
+    networks:
+      - agos-network
+    depends_on:
+      - agos-app
+
+networks:
+  agos-network:
+    driver: bridge
+
+volumes:
+  postgres_data:

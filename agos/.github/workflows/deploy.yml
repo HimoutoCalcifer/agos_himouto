@@ -1,0 +1,210 @@
+name: Deploy AGOS to DigitalOcean
+
+on:
+  push:
+    branches:
+      - main
+      - production
+  pull_request:
+    branches:
+      - main
+
+env:
+  NODE_VERSION: "18"
+  DOCKER_IMAGE_NAME: agos-monitoring
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests (if available)
+        run: npm test
+        continue-on-error: true
+
+      - name: Lint code (optional)
+        run: |
+          if [ -f "package.json" ] && grep -q "eslint" package.json; then
+            npm run lint
+          fi
+        continue-on-error: true
+
+  build-and-deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/production'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci --only=production
+
+      - name: Build application
+        run: npm run build
+        continue-on-error: true
+
+      - name: Create deployment archive
+        run: |
+          tar -czf agos-deployment.tar.gz \
+            --exclude=node_modules \
+            --exclude=.git \
+            --exclude=.github \
+            --exclude=*.log \
+            --exclude=.env \
+            .
+
+      - name: Deploy to DigitalOcean Droplet
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.DIGITALOCEAN_HOST }}
+          username: ${{ secrets.DIGITALOCEAN_USERNAME }}
+          key: ${{ secrets.DIGITALOCEAN_SSH_KEY }}
+          port: ${{ secrets.DIGITALOCEAN_PORT || 22 }}
+          script: |
+            set -e
+
+            # Define variables
+            APP_DIR="/var/www/agos"
+            BACKUP_DIR="/var/backups/agos-$(date +%Y%m%d-%H%M%S)"
+
+            echo "🚀 Starting AGOS deployment..."
+
+            # Create backup of current deployment
+            if [ -d "$APP_DIR" ]; then
+              echo "📦 Creating backup..."
+              sudo mkdir -p /var/backups
+              sudo cp -r $APP_DIR $BACKUP_DIR
+              echo "✅ Backup created at $BACKUP_DIR"
+            fi
+
+            # Create app directory if it doesn't exist
+            sudo mkdir -p $APP_DIR
+
+            # Stop existing services
+            echo "⏹️ Stopping existing services..."
+            sudo systemctl stop agos || true
+            sudo docker-compose -f $APP_DIR/docker-compose.yml down || true
+
+            # Clear old files (keep logs and data)
+            sudo find $APP_DIR -maxdepth 1 -type f -delete || true
+            sudo find $APP_DIR -maxdepth 1 -type d ! -name logs ! -name data ! -name . -exec rm -rf {} + || true
+
+      - name: Upload deployment files
+        uses: appleboy/scp-action@v0.1.4
+        with:
+          host: ${{ secrets.DIGITALOCEAN_HOST }}
+          username: ${{ secrets.DIGITALOCEAN_USERNAME }}
+          key: ${{ secrets.DIGITALOCEAN_SSH_KEY }}
+          port: ${{ secrets.DIGITALOCEAN_PORT || 22 }}
+          source: "agos-deployment.tar.gz"
+          target: "/tmp/"
+
+      - name: Extract and configure deployment
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.DIGITALOCEAN_HOST }}
+          username: ${{ secrets.DIGITALOCEAN_USERNAME }}
+          key: ${{ secrets.DIGITALOCEAN_SSH_KEY }}
+          port: ${{ secrets.DIGITALOCEAN_PORT || 22 }}
+          script: |
+            set -e
+
+            APP_DIR="/var/www/agos"
+
+            # Extract deployment files
+            echo "📦 Extracting deployment files..."
+            cd $APP_DIR
+            sudo tar -xzf /tmp/agos-deployment.tar.gz
+            sudo chown -R $USER:$USER $APP_DIR
+
+            # Setup environment file
+            echo "⚙️ Configuring environment..."
+            if [ ! -f .env ]; then
+              cp .env.example .env
+              echo "🔧 Please update .env file with your configuration"
+            fi
+
+            # Install dependencies
+            echo "📦 Installing Node.js dependencies..."
+            npm install --production
+
+            # Build Docker images
+            echo "🐳 Building Docker containers..."
+            sudo docker-compose build
+
+            # Start services
+            echo "🚀 Starting services..."
+            sudo docker-compose up -d
+
+            # Wait for services to start
+            echo "⏳ Waiting for services to start..."
+            sleep 30
+
+            # Health check
+            echo "🏥 Performing health check..."
+            curl -f http://localhost:3000/api/health || {
+              echo "❌ Health check failed!"
+              sudo docker-compose logs agos-app
+              exit 1
+            }
+
+            # Setup system service (optional)
+            sudo tee /etc/systemd/system/agos.service > /dev/null <<EOF
+            [Unit]
+            Description=AGOS Flood Monitoring System
+            After=network.target docker.service
+            Requires=docker.service
+
+            [Service]
+            Type=oneshot
+            RemainAfterExit=yes
+            WorkingDirectory=$APP_DIR
+            ExecStart=/usr/bin/docker-compose up -d
+            ExecStop=/usr/bin/docker-compose down
+            User=root
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+
+            sudo systemctl daemon-reload
+            sudo systemctl enable agos
+
+            # Clean up
+            rm -f /tmp/agos-deployment.tar.gz
+
+            echo "✅ AGOS deployment completed successfully!"
+            echo "🌐 Application should be available at: http://${{ secrets.DIGITALOCEAN_HOST }}:3000"
+
+  notify:
+    needs: [test, build-and-deploy]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Notify deployment status
+        run: |
+          if [ "${{ needs.build-and-deploy.result }}" = "success" ]; then
+            echo "✅ AGOS deployment successful!"
+          else
+            echo "❌ AGOS deployment failed!"
+            exit 1
+          fi
